@@ -41,9 +41,9 @@ int pins[] = {5, 18, 19, 21};
 // --- State Variables ---
 float phase = 0; 
 
-volatile float fb_amplitude = 45.0;
-volatile float fb_lag = 1.0;
-volatile float fb_power = 2.0;
+volatile float fb_amplitude = 70.0;
+volatile float fb_lag = 1.2;
+volatile float fb_power = 1.0;
 
 // Telemetry Variables to share between loop() and the TCP Task
 volatile float sensor_voltage_out = 0.0;

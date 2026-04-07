@@ -1,8 +1,12 @@
 import sys
+import os
+import csv
+from collections import deque
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QSlider, QLabel, QFrame, QHBoxLayout, QPushButton)
 from PyQt5.QtCore import Qt
 from PyQt5.QtNetwork import QTcpSocket, QAbstractSocket
+import pyqtgraph as pg
 
 # --- TCP/IP Configuration ---
 ESP32_IP = "10.213.8.189"
@@ -13,7 +17,20 @@ class TCPIPController(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Robot Local TCP/IP Controller")
-        self.resize(450, 400)
+        self.resize(500, 750)
+
+        # Data buffers for the last 100 points
+        self.max_points = 100
+        self.time_data = deque(maxlen=self.max_points)
+        self.voltage_data = deque(maxlen=self.max_points)
+        self.current_data = deque(maxlen=self.max_points)
+        self.time_counter = 0
+
+        # Recording state
+        self.is_recording = False
+        self.csv_file = None
+        self.csv_writer = None
+        self.log_folder = "data_logs"
 
         # Initialize network socket
         self.socket = QTcpSocket(self)
@@ -24,6 +41,9 @@ class TCPIPController(QMainWindow):
         self.connect_to_robot()
 
     def init_ui(self):
+        pg.setConfigOption('background', 'w')
+        pg.setConfigOption('foreground', 'k')
+
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         layout = QVBoxLayout(main_widget)
@@ -45,10 +65,9 @@ class TCPIPController(QMainWindow):
         status_layout.addWidget(self.btn_reconnect)
         layout.addLayout(status_layout)
 
-        # Separator
         layout.addWidget(self.create_line())
 
-        # --- Telemetry Display ---
+        # --- Telemetry & Recording Controls ---
         telemetry_layout = QHBoxLayout()
         self.lbl_voltage = QLabel("Voltage: -- V")
         self.lbl_voltage.setStyleSheet("font-size: 16px; color: blue;")
@@ -56,9 +75,30 @@ class TCPIPController(QMainWindow):
         self.lbl_current = QLabel("Current: -- A")
         self.lbl_current.setStyleSheet("font-size: 16px; color: red;")
 
+        self.btn_record = QPushButton("Start Recording")
+        self.btn_record.setStyleSheet("background-color: lightgray; font-weight: bold;")
+        self.btn_record.clicked.connect(self.toggle_recording)
+
         telemetry_layout.addWidget(self.lbl_voltage)
         telemetry_layout.addWidget(self.lbl_current)
+        telemetry_layout.addWidget(self.btn_record)
         layout.addLayout(telemetry_layout)
+
+        # --- Telemetry Plots ---
+        self.graph_widget = pg.GraphicsLayoutWidget()
+        layout.addWidget(self.graph_widget)
+
+        self.plot_v = self.graph_widget.addPlot(title="Voltage (V)")
+        self.plot_v.showGrid(x=True, y=True)
+        self.plot_v.setLabel('left', 'Voltage', units='V')
+        self.curve_v = self.plot_v.plot(pen=pg.mkPen('b', width=2))
+
+        self.graph_widget.nextRow()
+
+        self.plot_c = self.graph_widget.addPlot(title="Current (A)")
+        self.plot_c.showGrid(x=True, y=True)
+        self.plot_c.setLabel('left', 'Current', units='A')
+        self.curve_c = self.plot_c.plot(pen=pg.mkPen('r', width=2))
 
         layout.addWidget(self.create_line())
 
@@ -72,8 +112,6 @@ class TCPIPController(QMainWindow):
         self.slider_amp, self.label_amp = self.create_slider(
             "amplitude", "Amplitude [deg]", 5, 90, 45, layout, scale=1.0
         )
-
-        layout.addStretch()
 
     def create_line(self):
         line = QFrame()
@@ -103,6 +141,60 @@ class TCPIPController(QMainWindow):
 
         return slider, label
 
+    # --- Recording Functions ---
+
+    def toggle_recording(self):
+        if not self.is_recording:
+            self.start_recording()
+        else:
+            self.stop_recording()
+
+    def start_recording(self):
+        # Create folder if it doesn't exist
+        if not os.path.exists(self.log_folder):
+            os.makedirs(self.log_folder)
+
+        # Grab current slider values
+        lag = self.slider_lag.value() * 0.1
+        amp = self.slider_amp.value() * 1.0
+
+        # Calculate document number by checking existing files
+        existing_files = len([f for f in os.listdir(self.log_folder) if f.endswith('.csv')])
+        doc_num = existing_files + 1
+
+        # Format: LAG_AMPLITUDE_NUMBEROFDOCUMENT.csv
+        filename = f"{lag:.1f}_{amp:.1f}_{doc_num}.csv"
+        filepath = os.path.join(self.log_folder, filename)
+
+        try:
+            self.csv_file = open(filepath, mode='w', newline='')
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow(['TimeStep', 'Voltage_V', 'Current_A'])
+
+            self.is_recording = True
+            self.btn_record.setText("Stop Recording")
+            self.btn_record.setStyleSheet("background-color: red; color: white; font-weight: bold;")
+            print(f"Started recording to: {filepath}")
+        except Exception as e:
+            print(f"Failed to start recording: {e}")
+
+    def stop_recording(self):
+        self.is_recording = False
+        self.btn_record.setText("Start Recording")
+        self.btn_record.setStyleSheet("background-color: lightgray; color: black; font-weight: bold;")
+
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file = None
+            self.csv_writer = None
+            print("Recording stopped and file saved.")
+
+    def closeEvent(self, event):
+        # Safely close the CSV file if the app is closed while recording
+        if self.is_recording:
+            self.stop_recording()
+        event.accept()
+
     # --- Networking Functions ---
 
     def connect_to_robot(self):
@@ -115,12 +207,16 @@ class TCPIPController(QMainWindow):
         if state == QAbstractSocket.ConnectedState:
             self.lbl_status.setText("Status: Connected")
             self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
-            self.push_initial_state()  # Push slider values once connected
+            self.push_initial_state()
         elif state == QAbstractSocket.UnconnectedState:
             self.lbl_status.setText("Status: Disconnected")
             self.lbl_status.setStyleSheet("color: red; font-weight: bold;")
             self.lbl_voltage.setText("Voltage: -- V")
             self.lbl_current.setText("Current: -- A")
+
+            # Automatically stop recording if the robot disconnects
+            if self.is_recording:
+                self.stop_recording()
 
     def push_initial_state(self):
         self.send_tcp_update("power", self.slider_power.value() * 0.1)
@@ -136,20 +232,30 @@ class TCPIPController(QMainWindow):
             print("Cannot send: Not connected to ESP32")
 
     def read_tcp_data(self):
-        """Triggered automatically whenever the ESP32 sends data."""
         while self.socket.canReadLine():
             try:
                 line = self.socket.readLine().data().decode('utf-8').strip()
-                # Parse the incoming telemetry string
                 if line.startswith("telemetry:"):
                     parts = line.split(":")
                     if len(parts) == 3:
                         voltage = float(parts[1])
                         current = float(parts[2])
 
-                        # Update the GUI labels
                         self.lbl_voltage.setText(f"Voltage: {voltage:.2f} V")
                         self.lbl_current.setText(f"Current: {current:.2f} A")
+
+                        self.time_counter += 1
+                        self.time_data.append(self.time_counter)
+                        self.voltage_data.append(voltage)
+                        self.current_data.append(current)
+
+                        self.curve_v.setData(list(self.time_data), list(self.voltage_data))
+                        self.curve_c.setData(list(self.time_data), list(self.current_data))
+
+                        # Write to CSV if currently recording
+                        if self.is_recording and self.csv_writer:
+                            self.csv_writer.writerow([self.time_counter, round(voltage, 3), round(current, 3)])
+
             except Exception as e:
                 print(f"Error reading socket data: {e}")
 
