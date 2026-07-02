@@ -9,7 +9,7 @@ from PyQt5.QtNetwork import QTcpSocket, QAbstractSocket
 import pyqtgraph as pg
 
 # --- TCP/IP Configuration ---
-ESP32_IP = "10.213.8.189"
+ESP32_IP = "10.236.143.102"
 TCP_PORT = 8080
 
 
@@ -17,14 +17,18 @@ class TCPIPController(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Robot Local TCP/IP Controller")
-        self.resize(500, 750)
+        self.resize(500, 800)
 
         # Data buffers for the last 100 points
         self.max_points = 100
         self.time_data = deque(maxlen=self.max_points)
         self.voltage_data = deque(maxlen=self.max_points)
         self.current_data = deque(maxlen=self.max_points)
-        self.time_counter = 0
+
+        # --- Low-Pass Filter Variables ---
+        self.filter_alpha = 0.8  # Smoothing factor (0.0 to 1.0). Lower = more smooth.
+        self.filtered_voltage = None
+        self.filtered_current = None
 
         # Recording state
         self.is_recording = False
@@ -91,6 +95,7 @@ class TCPIPController(QMainWindow):
         self.plot_v = self.graph_widget.addPlot(title="Voltage (V)")
         self.plot_v.showGrid(x=True, y=True)
         self.plot_v.setLabel('left', 'Voltage', units='V')
+        self.plot_v.setLabel('bottom', 'Time', units='ms')
         self.curve_v = self.plot_v.plot(pen=pg.mkPen('b', width=2))
 
         self.graph_widget.nextRow()
@@ -98,11 +103,15 @@ class TCPIPController(QMainWindow):
         self.plot_c = self.graph_widget.addPlot(title="Current (A)")
         self.plot_c.showGrid(x=True, y=True)
         self.plot_c.setLabel('left', 'Current', units='A')
+        self.plot_c.setLabel('bottom', 'Time', units='ms')
         self.curve_c = self.plot_c.plot(pen=pg.mkPen('r', width=2))
 
         layout.addWidget(self.create_line())
 
         # --- Controls ---
+        self.slider_freq, self.label_freq = self.create_slider(
+            "frequency", "Frequency", 1, 100, 20, layout, scale=0.01
+        )
         self.slider_power, self.label_power = self.create_slider(
             "power", "Sine Power", 10, 40, 20, layout, scale=0.1
         )
@@ -120,7 +129,7 @@ class TCPIPController(QMainWindow):
         return line
 
     def create_slider(self, param_key, display_name, min_val, max_val, init_val, layout, scale):
-        label = QLabel(f"{display_name}: {init_val * scale:.1f}")
+        label = QLabel(f"{display_name}: {init_val * scale:.2f}")
         label.setStyleSheet("font-size: 14px; font-weight: bold;")
 
         slider = QSlider(Qt.Horizontal)
@@ -129,7 +138,7 @@ class TCPIPController(QMainWindow):
         slider.setValue(init_val)
 
         slider.valueChanged.connect(
-            lambda val, n=display_name, s=scale: label.setText(f"{n}: {val * s:.1f}")
+            lambda val, n=display_name, s=scale: label.setText(f"{n}: {val * s:.2f}")
         )
         slider.sliderReleased.connect(
             lambda k=param_key, sl=slider, sc=scale: self.send_tcp_update(k, sl.value() * sc)
@@ -150,26 +159,24 @@ class TCPIPController(QMainWindow):
             self.stop_recording()
 
     def start_recording(self):
-        # Create folder if it doesn't exist
         if not os.path.exists(self.log_folder):
             os.makedirs(self.log_folder)
 
-        # Grab current slider values
+        freq = self.slider_freq.value() * 0.01
         lag = self.slider_lag.value() * 0.1
         amp = self.slider_amp.value() * 1.0
 
-        # Calculate document number by checking existing files
         existing_files = len([f for f in os.listdir(self.log_folder) if f.endswith('.csv')])
         doc_num = existing_files + 1
 
-        # Format: LAG_AMPLITUDE_NUMBEROFDOCUMENT.csv
-        filename = f"{lag:.1f}_{amp:.1f}_{doc_num}.csv"
+        filename = f"{freq:.2f}_{lag:.1f}_{amp:.1f}_{doc_num}.csv"
         filepath = os.path.join(self.log_folder, filename)
 
         try:
             self.csv_file = open(filepath, mode='w', newline='')
             self.csv_writer = csv.writer(self.csv_file)
-            self.csv_writer.writerow(['TimeStep', 'Voltage_V', 'Current_A'])
+            # Updated header to reflect the actual timestamp
+            self.csv_writer.writerow(['Timestamp_ms', 'Voltage_V', 'Current_A'])
 
             self.is_recording = True
             self.btn_record.setText("Stop Recording")
@@ -190,7 +197,6 @@ class TCPIPController(QMainWindow):
             print("Recording stopped and file saved.")
 
     def closeEvent(self, event):
-        # Safely close the CSV file if the app is closed while recording
         if self.is_recording:
             self.stop_recording()
         event.accept()
@@ -214,18 +220,22 @@ class TCPIPController(QMainWindow):
             self.lbl_voltage.setText("Voltage: -- V")
             self.lbl_current.setText("Current: -- A")
 
-            # Automatically stop recording if the robot disconnects
+            # Reset filters on disconnect so old data doesn't skew new connections
+            self.filtered_voltage = None
+            self.filtered_current = None
+
             if self.is_recording:
                 self.stop_recording()
 
     def push_initial_state(self):
+        self.send_tcp_update("frequency", self.slider_freq.value() * 0.01)
         self.send_tcp_update("power", self.slider_power.value() * 0.1)
         self.send_tcp_update("lag", self.slider_lag.value() * 0.1)
         self.send_tcp_update("amplitude", self.slider_amp.value() * 1.0)
 
     def send_tcp_update(self, parameter, value):
         if self.socket.state() == QAbstractSocket.ConnectedState:
-            message = f"{parameter}:{round(value, 1)}\n"
+            message = f"{parameter}:{round(value, 2)}\n"
             self.socket.write(message.encode('utf-8'))
             print(f"Sent: {message.strip()}")
         else:
@@ -237,24 +247,40 @@ class TCPIPController(QMainWindow):
                 line = self.socket.readLine().data().decode('utf-8').strip()
                 if line.startswith("telemetry:"):
                     parts = line.split(":")
-                    if len(parts) == 3:
-                        voltage = float(parts[1])
-                        current = float(parts[2])
+                    # Check for 4 parts: "telemetry", "timestamp", "voltage", "current"
+                    if len(parts) == 4:
+                        timestamp_ms = int(parts[1])
+                        raw_voltage = float(parts[2])
+                        raw_current = float(parts[3])
 
-                        self.lbl_voltage.setText(f"Voltage: {voltage:.2f} V")
-                        self.lbl_current.setText(f"Current: {current:.2f} A")
+                        # --- Apply Low-Pass Filter ---
+                        if self.filtered_voltage is None or self.filtered_current is None:
+                            # Initialize filter with the first data points
+                            self.filtered_voltage = raw_voltage
+                            self.filtered_current = raw_current
+                        else:
+                            # EMA formula: (Alpha * New Value) + ((1 - Alpha) * Previous Filtered Value)
+                            self.filtered_voltage = (self.filter_alpha * raw_voltage) + (
+                                        (1.0 - self.filter_alpha) * self.filtered_voltage)
+                            self.filtered_current = (self.filter_alpha * raw_current) + (
+                                        (1.0 - self.filter_alpha) * self.filtered_current)
 
-                        self.time_counter += 1
-                        self.time_data.append(self.time_counter)
-                        self.voltage_data.append(voltage)
-                        self.current_data.append(current)
+                        # Update UI with filtered data
+                        self.lbl_voltage.setText(f"Voltage: {self.filtered_voltage:.2f} V")
+                        self.lbl_current.setText(f"Current: {self.filtered_current:.2f} A")
+
+                        # Use actual ESP32 timestamp instead of counter
+                        self.time_data.append(timestamp_ms)
+                        self.voltage_data.append(self.filtered_voltage)
+                        self.current_data.append(self.filtered_current)
 
                         self.curve_v.setData(list(self.time_data), list(self.voltage_data))
                         self.curve_c.setData(list(self.time_data), list(self.current_data))
 
-                        # Write to CSV if currently recording
+                        # Write filtered data and actual timestamp to CSV
                         if self.is_recording and self.csv_writer:
-                            self.csv_writer.writerow([self.time_counter, round(voltage, 3), round(current, 3)])
+                            self.csv_writer.writerow(
+                                [timestamp_ms, round(self.filtered_voltage, 3), round(self.filtered_current, 3)])
 
             except Exception as e:
                 print(f"Error reading socket data: {e}")

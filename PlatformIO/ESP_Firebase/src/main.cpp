@@ -3,21 +3,25 @@
 #include <Bluepad32.h>
 #include <ESP32Servo.h> 
 #include <math.h>
+#include <WebSocketsServer.h>
+#include <ArduinoJson.h> // NEW: For dynamic UI configuration
 
 // --- Function Prototypes ---
 void updateServos();
 void onConnectedController(ControllerPtr ctl);
 void onDisconnectedController(ControllerPtr ctl);
-void tcpServerTaskCode(void * parameter); 
+void webSocketTaskCode(void * parameter); 
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+void sendConfiguration(uint8_t num); // NEW: Handshake protocol
 
 // --- 1. Hotspot Wi-Fi Credentials ---
 const char* ssid = "Galaxy S24 Ultra D870"; 
 const char* password = "12345678";
 
-// --- 2. TCP Server Setup ---
-const int TCP_PORT = 8080;
-WiFiServer server(TCP_PORT);
-TaskHandle_t TCPServerTask;
+// --- 2. WebSocket Server Setup ---
+const int WS_PORT = 8080;
+WebSocketsServer webSocket = WebSocketsServer(WS_PORT);
+TaskHandle_t WSTask;
 
 // --- 3. Hardware Pins ---
 #define AIN1 33 
@@ -25,8 +29,8 @@ TaskHandle_t TCPServerTask;
 #define PWMA 27 
 
 // --- Sensor Pins ---
-#define PIN_VOLTAGE 36 // VP
-#define PIN_CURRENT 39 // VN
+#define PIN_VOLTAGE 39 // VP
+#define PIN_CURRENT 36 // VN
 
 const int SERVO_REST = 90;     
 const int LIFT_SIDE = -1; 
@@ -42,10 +46,11 @@ int pins[] = {5, 18, 19, 21};
 float phase = 0; 
 
 volatile float fb_amplitude = 70.0;
-volatile float fb_lag = 1.2;
+volatile float fb_lag = 0.8;
 volatile float fb_power = 1.0;
+volatile float fb_frequency = 0.2; 
 
-// Telemetry Variables to share between loop() and the TCP Task
+// Telemetry Variables to share between loop() and the WebSocket Task
 volatile float sensor_voltage_out = 0.0;
 volatile float sensor_current_out = 0.0;
 
@@ -91,56 +96,108 @@ void setup() {
     Serial.print("ESP32 IP Address: ");
     Serial.println(WiFi.localIP()); 
 
-    server.begin();
-    xTaskCreatePinnedToCore(tcpServerTaskCode, "TCPServerTask", 10000, NULL, 1, &TCPServerTask, 0);                  
+    // Initialize WebSocket Server
+    webSocket.begin();
+    webSocket.onEvent(webSocketEvent);
+
+    // Create RTOS task to handle WebSockets asynchronously
+    xTaskCreatePinnedToCore(webSocketTaskCode, "WSTask", 10000, NULL, 1, &WSTask, 0);                  
     BP32.setup(&onConnectedController, &onDisconnectedController);
 }
 
-void tcpServerTaskCode(void * parameter) {
+// --- Dynamic Configuration Handshake ---
+void sendConfiguration(uint8_t num) {
+    StaticJsonDocument<1024> doc;
+    
+    // --- 1. Define UI Sliders ---
+    JsonArray sliders = doc.createNestedArray("sliders");
+    
+    JsonObject s1 = sliders.createNestedObject();
+    s1["id"] = "amplitude"; s1["label"] = "Amplitude"; 
+    s1["min"] = 0; s1["max"] = 100; s1["val"] = 70; s1["scale"] = 1.0;
+    
+    JsonObject s2 = sliders.createNestedObject();
+    s2["id"] = "lag"; s2["label"] = "Phase Lag"; 
+    s2["min"] = 0; s2["max"] = 200; s2["val"] = 80; s2["scale"] = 0.01; // 80 * 0.01 = 0.8
+    
+    JsonObject s3 = sliders.createNestedObject();
+    s3["id"] = "power"; s3["label"] = "Wave Power"; 
+    s3["min"] = 10; s3["max"] = 300; s3["val"] = 100; s3["scale"] = 0.01; // 100 * 0.01 = 1.0
+    
+    JsonObject s4 = sliders.createNestedObject();
+    s4["id"] = "frequency"; s4["label"] = "Frequency"; 
+    s4["min"] = 1; s4["max"] = 100; s4["val"] = 20; s4["scale"] = 0.01; // 20 * 0.01 = 0.2
+
+    // --- 2. Define Telemetry Layout ---
+    JsonArray telemetry = doc.createNestedArray("telemetry");
+    telemetry.add("Voltage (V)");
+    telemetry.add("Current (A)");
+
+    String configStr;
+    serializeJson(doc, configStr);
+    String payload = "CONFIG:" + configStr;
+    webSocket.sendTXT(num, payload);
+}
+
+// --- WebSocket Event Handler ---
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+    switch(type) {
+        case WStype_DISCONNECTED:
+            Serial.printf("[%u] WebSocket Client Disconnected\n", num);
+            break;
+            
+        case WStype_CONNECTED: {
+            IPAddress ip = webSocket.remoteIP(num);
+            Serial.printf("[%u] WebSocket Client Connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
+            sendConfiguration(num); // Trigger the UI build
+            break;
+        }
+            
+        case WStype_TEXT: {
+            String request = String((char*)payload);
+            request.trim(); 
+            
+            // Handle SET format from new UI (e.g., SET:frequency:0.25)
+            if (request.startsWith("SET:")) {
+                int firstColon = request.indexOf(':');
+                int secondColon = request.indexOf(':', firstColon + 1);
+                
+                if (firstColon != -1 && secondColon != -1) {
+                    String key = request.substring(firstColon + 1, secondColon);
+                    float value = request.substring(secondColon + 1).toFloat();
+                    
+                    if (key == "amplitude") fb_amplitude = value;
+                    else if (key == "lag") fb_lag = value;
+                    else if (key == "power") fb_power = value;
+                    else if (key == "frequency") fb_frequency = value; 
+                    
+                    Serial.printf("Updated -> %s: %.2f\n", key.c_str(), value);
+                }
+            }
+            break;
+        }
+    }
+}
+
+// --- WebSocket RTOS Task ---
+void webSocketTaskCode(void * parameter) {
     unsigned long lastTelemetryTime = 0;
 
     for(;;) {
-        WiFiClient client = server.available(); 
-        
-        if (client) {
-            Serial.println("New TCP Client Connected");
-            client.setTimeout(50); 
+        webSocket.loop(); 
+
+        unsigned long currentMillis = millis();
+        if (currentMillis - lastTelemetryTime >= 50) {
+            lastTelemetryTime = currentMillis;
             
-            while (client.connected()) {
-                // 1. Check for incoming slider data from Python
-                if (client.available()) {
-                    String request = client.readStringUntil('\n');
-                    request.trim(); 
-                    
-                    if (request.length() > 0) {
-                        int colonIndex = request.indexOf(':');
-                        if (colonIndex != -1) {
-                            String key = request.substring(0, colonIndex);
-                            float value = request.substring(colonIndex + 1).toFloat();
-                            
-                            if (key == "amplitude") fb_amplitude = value;
-                            else if (key == "lag") fb_lag = value;
-                            else if (key == "power") fb_power = value;
-                            
-                            Serial.printf("Updated -> %s: %.2f\n", key.c_str(), value);
-                        }
-                    }
-                }
-
-                // 2. Push telemetry data to Python every 500ms
-                unsigned long currentMillis = millis();
-                if (currentMillis - lastTelemetryTime >= 50) {
-                    lastTelemetryTime = currentMillis;
-                    // Format: "telemetry:voltage:current\n"
-                    client.printf("telemetry:%.2f:%.2f\n", sensor_voltage_out, sensor_current_out);
-                }
-
-                vTaskDelay(10 / portTICK_PERIOD_MS); 
-            }
-            client.stop();
-            Serial.println("TCP Client Disconnected");
+            // Format strictly as required by the new website UI: DATA:<timestamp>,<val1>,<val2>
+            char msg[64];
+            snprintf(msg, sizeof(msg), "DATA:%lu,%.2f,%.2f", currentMillis, sensor_voltage_out, sensor_current_out);
+            
+            webSocket.broadcastTXT(msg);
         }
-        vTaskDelay(200 / portTICK_PERIOD_MS); 
+
+        vTaskDelay(10 / portTICK_PERIOD_MS); 
     }
 }
 
@@ -153,12 +210,11 @@ void loop() {
     if (currentTime - lastPrintTime >= printInterval) {
         lastPrintTime = currentTime;
 
-        // Current Sensor (ACS712)
         // --- Current Sensor (ACS712) ---
         float currentPinV = analogRead(PIN_CURRENT) * (3.3 / 4095.0);
         
         // Linear best-fit calculation
-        sensor_current_out = (1.5 - currentPinV)/0.1;//(0.7995 * currentPinV) - 1.0931;
+        sensor_current_out = (1.5 - currentPinV)/0.1;
 
         // Voltage Sensor
         float voltagePinV = analogRead(PIN_VOLTAGE) * (3.3 / 4095.0);
@@ -183,9 +239,8 @@ void loop() {
         int stickY = ctl->axisY(); 
 
         if (abs(stickY) > STICK_DEADZONE) {
-            float currentSpeed = 0.2; 
-            if (stickY < 0) phase -= currentSpeed; 
-            else            phase += currentSpeed;
+            if (stickY < 0) phase -= fb_frequency; 
+            else            phase += fb_frequency;
 
             updateServos();
         } 
@@ -223,7 +278,7 @@ void updateServos() {
         } else {
             float p_i = phase + (i * fb_lag);
             float s = sin(p_i);
-            float sgn = (s >= 0) ? 1.0 : -1.0;
+            float sgn = (s >= 0) ? 1.0 : -1.0;         
             float wave = sgn * pow(abs(s), fb_power) * fb_amplitude;
             
             float lift = max(0.0f, wave); 

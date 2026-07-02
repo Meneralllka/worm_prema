@@ -4,18 +4,22 @@ from collections import deque
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QSlider, QLabel)
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QFont
 import pyqtgraph as pg
 
 # --- Robot Parameters ---
 LENGTHS = [100.0, 80.0, 125.0, 80.0, 100.0]
 BASE_MASSES = [63.0, 260.0, 130.0, 280.0, 63.0]
 
+# --- Global UI Settings ---
+GLOBAL_FONT_SIZE = 32  # Change this single variable to scale ALL text in the app
+
 
 class WormRobotSim(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Planar Worm Robot Kinematics & Locomotion Simulation")
-        self.resize(1300, 900)
+        self.resize(1800, 1200)
 
         # State variables
         self.phase = 0.0
@@ -60,7 +64,8 @@ class WormRobotSim(QMainWindow):
         pg.setConfigOption('foreground', 'k')
 
         # 1. Robot Motion (Top Left)
-        self.plot_robot = pg.PlotWidget(title="1. Robot Motion (Keys 1-4: Wave | A,Y,X: Toggles)")
+        self.plot_robot = pg.PlotWidget()
+        self.configure_plot(self.plot_robot, "1. Robot Motion (Keys 1-3: Wave | A,Y,X: Toggles)")
         self.plot_robot.setYRange(-20, 300)
         self.plot_robot.showGrid(x=True, y=True)
         self.robot_line = self.plot_robot.plot(pen=pg.mkPen('b', width=4), symbol='o', symbolBrush='b', symbolSize=8)
@@ -68,55 +73,84 @@ class WormRobotSim(QMainWindow):
         plot_layout.addWidget(self.plot_robot, 0, 0)
 
         # 2. Local CoM Trajectory (Top Right)
-        self.plot_com = pg.PlotWidget(title="2. Local CoM Trajectory (Gait Cycle)")
+        self.plot_com = pg.PlotWidget()
+        self.configure_plot(self.plot_com, "2. Local CoM Trajectory (Gait Cycle)")
         self.plot_com.showGrid(x=True, y=True)
         self.com_path = self.plot_com.plot(pen=pg.mkPen('r', width=2), symbol='o', symbolSize=4, symbolBrush='r')
         plot_layout.addWidget(self.plot_com, 0, 1)
 
         # 3. Global Displacement (Bottom Left)
-        self.plot_disp = pg.PlotWidget(title="3. Global X Displacement vs. Time")
-        self.plot_disp.setLabel('left', 'Forward Distance (mm)')
-        self.plot_disp.setLabel('bottom', 'Frames')
+        self.plot_disp = pg.PlotWidget()
+        self.configure_plot(self.plot_disp, "3. Global X Displacement vs. Time", ylabel="Forward Distance (mm)",
+                            xlabel="Frames")
         self.plot_disp.showGrid(x=True, y=True)
         self.disp_line = self.plot_disp.plot(pen=pg.mkPen('g', width=3))
         plot_layout.addWidget(self.plot_disp, 1, 0)
 
         # 4. Linear Velocity (Bottom Right)
-        self.plot_vel = pg.PlotWidget(title="4. Linear Velocity vs. Time")
-        self.plot_vel.setLabel('left', 'Velocity (mm/s)')
-        self.plot_vel.setLabel('bottom', 'Frames')
+        self.plot_vel = pg.PlotWidget()
+        self.configure_plot(self.plot_vel, "4. Linear Velocity vs. Time", ylabel="Velocity (mm/s)", xlabel="Frames")
         self.plot_vel.showGrid(x=True, y=True)
-        self.vel_line = self.plot_vel.plot(pen=pg.mkPen('m', width=3))  # Magenta
+        self.vel_line = self.plot_vel.plot(pen=pg.mkPen('m', width=3))
         plot_layout.addWidget(self.plot_vel, 1, 1)
 
-        layout.addLayout(plot_layout, stretch=4)  # Give grid more width
+        layout.addLayout(plot_layout, stretch=4)
 
         # --- Right Side: Controls & Status ---
         control_layout = QVBoxLayout()
 
         self.com_label = QLabel("Global CoM: (0.00, 0.00)")
-        self.com_label.setStyleSheet("font-size: 16px; font-weight: bold; color: red; margin-bottom: 10px;")
+        self.com_label.setStyleSheet(
+            f"font-size: {GLOBAL_FONT_SIZE}px; font-weight: bold; color: red; margin-bottom: 5px;")
         control_layout.addWidget(self.com_label)
+
+        self.avg_vel_label = QLabel("Avg Velocity:\n0.00 mm/s")
+        self.avg_vel_label.setStyleSheet(
+            f"font-size: {GLOBAL_FONT_SIZE}px; font-weight: bold; color: green; margin-bottom: 15px;")
+        control_layout.addWidget(self.avg_vel_label)
 
         self.status_label = QLabel(self.get_status_text())
         self.status_label.setStyleSheet(
-            "font-size: 14px; color: blue; margin-bottom: 20px; padding: 5px; border: 1px solid blue;")
+            f"font-size: {GLOBAL_FONT_SIZE}px; color: blue; margin-bottom: 20px; padding: 5px; border: 1px solid blue;")
         control_layout.addWidget(self.status_label)
 
-        self.slider_water = self.create_slider("Water in Tail (L1) [g]", 0, 300, 150, control_layout)
-        self.label_water_l5 = QLabel("Water in Head (L5): 150 g")
-        self.label_water_l5.setStyleSheet("font-weight: bold; margin-bottom: 10px;")
+        self.slider_water = self.create_slider("Water Tail [g]", 0, 300, 150, control_layout)
+
+        self.label_water_l5 = QLabel("Water Head: 150 g")
+        self.label_water_l5.setStyleSheet(f"font-size: {GLOBAL_FONT_SIZE}px; font-weight: bold; margin-bottom: 10px;")
         control_layout.addWidget(self.label_water_l5)
 
-        self.slider_amp = self.create_slider("Wave Amplitude [deg]", 0, 90, 45, control_layout)
-        self.slider_lag = self.create_slider("Lag Magnitude", 1, 30, 10, control_layout, scale=0.1)
-        self.slider_power = self.create_slider("Sine Power (For Wave 4)", 10, 50, 20, control_layout, scale=0.1)
+        self.slider_amp = self.create_slider("Amplitude", 0, 90, 45, control_layout)
+        self.slider_lag = self.create_slider("Lag", 1, 30, 10, control_layout, scale=0.1)
 
         control_layout.addStretch()
-        layout.addLayout(control_layout, stretch=1)
+        layout.addLayout(control_layout, stretch=2)
+
+    def configure_plot(self, plot, title, xlabel=None, ylabel=None):
+        """Helper to apply global font sizes to pyqtgraph elements."""
+        # 1. Set Title Font
+        plot.setTitle(title, size=f"{GLOBAL_FONT_SIZE}px", color="k")
+
+        # 2. Set Axis Label Fonts
+        label_style = {'font-size': f"{GLOBAL_FONT_SIZE}px", 'color': 'k'}
+        if xlabel:
+            plot.setLabel('bottom', xlabel, **label_style)
+        if ylabel:
+            plot.setLabel('left', ylabel, **label_style)
+
+        # 3. Set Tick Marks Font
+        font = QFont()
+        font.setPixelSize(GLOBAL_FONT_SIZE)
+        plot.getAxis('bottom').setTickFont(font)
+        plot.getAxis('left').setTickFont(font)
+
+        # Adjust margins automatically so huge fonts don't get clipped off-screen
+        plot.getAxis('left').setWidth(GLOBAL_FONT_SIZE * 3)
+        plot.getAxis('bottom').setHeight(GLOBAL_FONT_SIZE * 2)
 
     def create_slider(self, name, min_val, max_val, init_val, layout, scale=1.0):
         label = QLabel(f"{name}: {init_val * scale:.1f}")
+        label.setStyleSheet(f"font-size: {GLOBAL_FONT_SIZE}px;")
         slider = QSlider(Qt.Horizontal)
         slider.setMinimum(min_val)
         slider.setMaximum(max_val)
@@ -124,7 +158,7 @@ class WormRobotSim(QMainWindow):
 
         if "Tail" in name:
             slider.valueChanged.connect(lambda val: label.setText(f"{name}: {val * scale:.1f}"))
-            slider.valueChanged.connect(lambda val: self.label_water_l5.setText(f"Water in Head (L5): {300 - val} g"))
+            slider.valueChanged.connect(lambda val: self.label_water_l5.setText(f"Water Head: {300 - val} g"))
         else:
             slider.valueChanged.connect(lambda val: label.setText(f"{name}: {val * scale:.1f}"))
 
@@ -133,8 +167,7 @@ class WormRobotSim(QMainWindow):
         return slider
 
     def get_status_text(self):
-        return (f"Active Wave: {self.wave_type}\n"
-                f"Toggles Active:\n"
+        return (f"Wave: {self.wave_type}\n"
                 f"Tail (A): {self.tail_lifted}\n"
                 f"Neck (Y): {self.neck_lifted}\n"
                 f"Head (X): {self.head_lifted}")
@@ -146,8 +179,6 @@ class WormRobotSim(QMainWindow):
             self.wave_type = 'Square'
         elif event.key() == Qt.Key_3:
             self.wave_type = 'Triangle'
-        elif event.key() == Qt.Key_4:
-            self.wave_type = 'Power Sine'
         elif event.key() == Qt.Key_A:
             self.tail_lifted = not self.tail_lifted
         elif event.key() == Qt.Key_Y:
@@ -166,7 +197,6 @@ class WormRobotSim(QMainWindow):
         water_l5 = 300.0 - water_l1
         amp_rad = np.radians(self.slider_amp.value())
         lag = self.slider_lag.value() * 0.1
-        power = self.slider_power.value() * 0.1
 
         self.phase -= self.phase_speed
         self.frame_count += 1
@@ -191,8 +221,6 @@ class WormRobotSim(QMainWindow):
                     wave = np.sign(np.sin(p_i)) * amp_rad
                 elif self.wave_type == 'Triangle':
                     wave = (2.0 / np.pi) * np.arcsin(np.sin(p_i)) * amp_rad
-                elif self.wave_type == 'Power Sine':
-                    wave = np.sign(np.sin(p_i)) * (np.abs(np.sin(p_i)) ** power) * amp_rad
 
                 lift = max(0.0, wave)
                 joint_angles[i] = lift * LIFT_SIDE
@@ -216,7 +244,6 @@ class WormRobotSim(QMainWindow):
         local_com_x = sum(masses[i] * (loc_x[i] + loc_x[i + 1]) / 2.0 for i in range(5)) / total_mass
         local_com_y = sum(masses[i] * (loc_y[i] + loc_y[i + 1]) / 2.0 for i in range(5)) / total_mass
 
-        # Calculate localized mass distribution per node (proxy for normal force)
         node_masses = np.zeros(6)
         for i in range(5):
             node_masses[i] += masses[i] / 2.0
@@ -268,15 +295,13 @@ class WormRobotSim(QMainWindow):
         correction = 0.0
 
         if grounded_nodes:
-            # Gather the masses of only the nodes touching the ground
             grounded_masses = [node_masses[i] for i in grounded_nodes]
             total_grounded_mass = sum(grounded_masses)
 
             if total_grounded_mass > 0:
                 for i, mass in zip(grounded_nodes, grounded_masses):
                     slip = proposed_global_x[i] - self.prev_global_x[i]
-                    if slip < 0:  # Node is attempting to slide backwards
-                        # Traction is proportional to the node's share of the grounded weight
+                    if slip < 0:
                         traction_weight = mass / total_grounded_mass
                         correction += abs(slip) * traction_weight
 
@@ -294,21 +319,18 @@ class WormRobotSim(QMainWindow):
             self.prev_global_com_x = global_com_x
             vel = 0.0
         else:
-            # dx / dt (mm/s)
             vel = (global_com_x - self.prev_global_com_x) / self.dt
 
         self.prev_global_com_x = global_com_x
 
-        # Add to raw history for smoothing
         self.vel_raw_hist.append(vel)
         smoothed_vel = sum(self.vel_raw_hist) / len(self.vel_raw_hist)
-        # ------------------------------------
 
         # 7. Update Plots
         self.robot_line.setData(global_joints_x, joints_y)
         self.com_point_robot.setData([global_com_x], [global_com_y])
         self.plot_robot.setXRange(global_com_x - 150, global_com_x + 350)
-        self.com_label.setText(f"Global CoM: ({global_com_x:.1f}, {global_com_y:.1f})")
+        self.com_label.setText(f"Global CoM:\n({global_com_x:.1f}, {global_com_y:.1f})")
 
         local_gait_x = global_com_x - global_joints_x[0]
         self.local_com_x_hist.append(local_gait_x)
@@ -321,6 +343,16 @@ class WormRobotSim(QMainWindow):
 
         self.vel_hist.append(smoothed_vel)
         self.vel_line.setData(list(self.time_hist), list(self.vel_hist))
+
+        # --- Net Distance / Time Velocity Calculation ---
+        if len(self.disp_hist) > 1:
+            dx = self.disp_hist[-1] - self.disp_hist[0]
+            dt = (len(self.disp_hist) - 1) * self.dt
+            avg_vel_300 = dx / dt
+        else:
+            avg_vel_300 = 0.0
+
+        self.avg_vel_label.setText(f"Avg Velocity:\n{avg_vel_300:.2f} mm/s")
 
 
 if __name__ == '__main__':
